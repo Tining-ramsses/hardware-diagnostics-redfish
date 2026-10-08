@@ -1,550 +1,965 @@
-# hardware-diagnostics-redfish
-Pure Redfish implementation for Dell TSR and HPE AHS hardware diagnostic collection
-Oui. J’ai revérifié les docs constructeur avant de te donner le code. Je corrige aussi un point important de mes réponses précédentes : pour Dell, le Redfish documenté ExportTechSupportReport dépose directement le ZIP sur un partage CIFS/NFS ; ce n’est pas un endpoint générique qui télécharge toujours le ZIP depuis l’iDRAC. Dell documente bien l’action et ses paramètres. 
+https://www.powershellgallery.com/packages/Invoke-SupportAssistCollectionLocalREDFISH/9.0.0/Content/Invoke-SupportAssistCollectionLocalREDFISH.psm1
+https://www.powershellgallery.com/packages/Invoke-SupportAssistCollectionLocalREDFISH/9.0.0
 
-Pour HPE, le workflow Redfish est différent : on découvre HpeiLOActiveHealthSystem, on récupère le lien AHS, puis le GET retourne le fichier binaire. 
+https://redfish.redoc.ly/docs/redfishservices/ilos/supplementdocuments/logservices/?utm_source
 
-Voici donc une V1 propre, 100 % Redfish, sans RACADM/iLOREST.
+Oui. Cette fois je te donne une version basée sur des implémentations constructeur réelles, pas sur des endpoints imaginés.
 
-Fonction PowerShell
+J’ai vérifié notamment le cmdlet officiel Dell Invoke-SupportAssistCollectionLocalREDFISH : Dell utilise bien l’action DellLCService.SupportAssistCollection, avec ShareType = Local, puis surveille le job et récupère le ZIP localement. La version actuelle 9.0.0 est publiée par Dell et indique explicitement que la collection locale se fait en Redfish. 
+
+Côté HPE, la documentation officielle décrit exactement le mécanisme AHS : découverte de HpeiLOActiveHealthSystem, récupération de Links.AHSLocation.extref, puis GET du fichier binaire .ahs avec downloadAll=1 ou days=N. 
+
+Ce que cette fonction fait
+
+* 100 % Redfish
+* Dell : SupportAssist / TSR local → ZIP téléchargé sur le PC qui exécute PowerShell
+* HPE : AHS → .ahs téléchargé sur le PC
+* Aucun RACADM
+* Aucun iLOREST
+* Aucun ShareName
+* Aucun ShareCredential
+* Aucun export CIFS/NFS
+* Détection constructeur par /redfish/v1
+* Détection de la capacité Dell par l’action réellement exposée par l’iDRAC, pas simplement par une version supposée
+* Pour HPE, découverte du lien AHS réellement exposé par l’iLO
+* Polling automatique du job Dell
+* Support du schéma Dell iDRAC9 et iDRAC10 en fonction de la Location réellement retournée
+* Si le contrôleur ne supporte pas la fonction : Unsupported, pas de fallback bidon.
 
 function Get-HardwareDiagnostic {
     [CmdletBinding()]
-    param (
-        # IP ou DNS de l'iDRAC / iLO
+    param(
         [Parameter(Mandatory = $true)]
         [string]$ManagementAddress,
-        # Compte iDRAC / iLO
         [Parameter(Mandatory = $true)]
-        [PSCredential]$ManagementCredential,
-        # Partage SMB, par exemple \\BMAAS-SRV\Diagnostics
-        [Parameter(Mandatory = $true)]
-        [string]$DestinationShare,
-        # Compte permettant d'écrire dans le partage SMB
-        # Pour Dell, ces identifiants sont transmis à l'iDRAC
+        [System.Management.Automation.PSCredential]$Credential,
         [Parameter(Mandatory = $false)]
-        [PSCredential]$ShareCredential,
-        # Nombre de jours AHS à télécharger côté HPE
+        [string]$OutputDirectory = ".\HardwareDiagnostics",
+        # Pour HPE :
+        # $null = téléchargement complet de l'AHS
+        # 7     = uniquement les 7 derniers jours
         [Parameter(Mandatory = $false)]
-        [ValidateRange(1,3650)]
-        [int]$AhsDays = 30,
-        # Ignorer les certificats auto-signés des iDRAC/iLO
+        [ValidateRange(1, 3650)]
+        [int]$AhsDays,
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 120)]
+        [int]$PollIntervalSeconds = 10,
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 180)]
+        [int]$TimeoutMinutes = 60,
+        # À utiliser si le certificat HTTPS du BMC est auto-signé
         [Parameter(Mandatory = $false)]
         [switch]$SkipCertificateCheck
     )
+    Set-StrictMode -Version Latest
     $ErrorActionPreference = "Stop"
     # ------------------------------------------------------------
-    # Helpers
+    # Normalisation adresse
     # ------------------------------------------------------------
-    function Write-DiagLog {
-        param(
-            [string]$Level,
-            [string]$Message
-        )
-        $prefix = switch ($Level) {
-            "INFO" { "[INFO]" }
-            "OK"   { "[ OK ]" }
-            "WARN" { "[WARN]" }
-            "ERROR"{ "[ERROR]" }
-            default { "[----]" }
-        }
-        Write-Host "$prefix $Message"
+    $ManagementAddress = $ManagementAddress.Trim()
+    $ManagementAddress = $ManagementAddress `
+        -replace '^https://', '' `
+        -replace '^http://', '' `
+        -replace '/+$', ''
+    $BaseUri = "https://$ManagementAddress"
+    # ------------------------------------------------------------
+    # Création répertoire local
+    # ------------------------------------------------------------
+    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
     }
-    function Get-BasicAuthHeader {
-        param(
-            [PSCredential]$Credential
-        )
-        $plain = "{0}:{1}" -f `
-            $Credential.UserName,
-            $Credential.GetNetworkCredential().Password
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
-        return @{
-            Authorization = "Basic " + `
-                [Convert]::ToBase64String($bytes)
+    $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
+    # ------------------------------------------------------------
+    # Ignore certificat uniquement si demandé
+    #
+    # Compatible PowerShell 5.1.
+    # ------------------------------------------------------------
+    if ($SkipCertificateCheck) {
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            # PowerShell 7 :
+            # -SkipCertificateCheck sera ajouté directement aux requêtes.
+        }
+        else {
+            # PowerShell 5.1 :
+            # ancienne méthode .NET nécessaire.
+            try {
+                if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+                    Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy
+{
+    public bool CheckValidationResult(
+        ServicePoint srvPoint,
+        X509Certificate certificate,
+        WebRequest request,
+        int certificateProblem)
+    {
+        return true;
+    }
+}
+"@
+                }
+                [System.Net.ServicePointManager]::CertificatePolicy =
+                    New-Object TrustAllCertsPolicy
+            }
+            catch {
+                Write-Verbose "Le bypass SSL PowerShell 5.1 n'a pas pu être installé : $($_.Exception.Message)"
+            }
         }
     }
-    function Invoke-RedfishRequest {
+    # ------------------------------------------------------------
+    # Helper : construction des paramètres Invoke-WebRequest
+    # ------------------------------------------------------------
+    function New-RequestParameters {
         param(
-            [Parameter(Mandatory = $true)]
             [string]$Uri,
-            [Parameter(Mandatory = $true)]
-            [ValidateSet("GET","POST","PATCH","DELETE")]
-            [string]$Method,
-            [PSCredential]$Credential,
-            [object]$Body,
-            [switch]$Binary,
+            [ValidateSet("GET", "POST", "PATCH")]
+            [string]$Method = "GET",
+            [string]$Body,
             [string]$OutFile
         )
-        $headers = Get-BasicAuthHeader -Credential $Credential
         $params = @{
             Uri         = $Uri
             Method      = $Method
-            Headers     = $headers
+            Credential  = $Credential
+            UseBasicParsing = $true
             ErrorAction = "Stop"
-        }
-        if ($SkipCertificateCheck) {
-            if ($PSVersionTable.PSVersion.Major -ge 7) {
-                $params.SkipCertificateCheck = $true
+            Headers     = @{
+                "Accept" = "application/json"
             }
         }
-        if ($null -ne $Body) {
-            $params.ContentType = "application/json"
-            $params.Body = ($Body | ConvertTo-Json -Depth 20)
+        if ($Body) {
+            $params["Body"] = $Body
+            $params["ContentType"] = "application/json"
         }
-        if ($Binary -and $OutFile) {
-            $params.OutFile = $OutFile
+        if ($OutFile) {
+            $params["OutFile"] = $OutFile
         }
-        return Invoke-WebRequest @params
+        if ($PSVersionTable.PSVersion.Major -ge 7 -and $SkipCertificateCheck) {
+            $params["SkipCertificateCheck"] = $true
+        }
+        return $params
     }
-    function Get-RedfishJson {
+    # ------------------------------------------------------------
+    # Helper : requête GET JSON
+    # ------------------------------------------------------------
+    function Invoke-RedfishJsonGet {
         param(
-            [string]$Uri,
-            [PSCredential]$Credential
+            [Parameter(Mandatory = $true)]
+            [string]$Uri
         )
-        $response = Invoke-RedfishRequest `
-            -Uri $Uri `
-            -Method GET `
-            -Credential $Credential
+        $params = New-RequestParameters -Uri $Uri -Method "GET"
+        $response = Invoke-WebRequest @params
+        if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+            throw "GET Redfish échoué : HTTP $($response.StatusCode) - $Uri"
+        }
+        if ([string]::IsNullOrWhiteSpace($response.Content)) {
+            return $null
+        }
         return ($response.Content | ConvertFrom-Json)
     }
     # ------------------------------------------------------------
-    # HTTPS certificate handling - PowerShell 5.1
+    # Helper : requête POST JSON
     # ------------------------------------------------------------
-    $oldCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
-    if ($SkipCertificateCheck -and
-        $PSVersionTable.PSVersion.Major -lt 7) {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
-            return $true
+    function Invoke-RedfishJsonPost {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Uri,
+            [Parameter(Mandatory = $true)]
+            [string]$Body
+        )
+        $params = New-RequestParameters `
+            -Uri $Uri `
+            -Method "POST" `
+            -Body $Body
+        return Invoke-WebRequest @params
+    }
+    # ------------------------------------------------------------
+    # Helper : URL relative -> URL absolue
+    # ------------------------------------------------------------
+    function ConvertTo-AbsoluteRedfishUri {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Uri
+        )
+        if ($Uri -match '^https?://') {
+            return $Uri
+        }
+        if ($Uri.StartsWith("/")) {
+            return "$BaseUri$Uri"
+        }
+        return "$BaseUri/$Uri"
+    }
+    # ------------------------------------------------------------
+    # Helper : récupération d'un header HTTP
+    # Compatible PowerShell 5.1 / 7
+    # ------------------------------------------------------------
+    function Get-ResponseHeader {
+        param(
+            [Parameter(Mandatory = $true)]
+            $Response,
+            [Parameter(Mandatory = $true)]
+            [string]$Name
+        )
+        try {
+            $value = $Response.Headers[$Name]
+            if ($value) {
+                return [string]$value
+            }
+        }
+        catch {
+        }
+        return $null
+    }
+    # ------------------------------------------------------------
+    # Helper : nom de fichier sécurisé
+    # ------------------------------------------------------------
+    function ConvertTo-SafeFileName {
+        param(
+            [string]$Name
+        )
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            return "diagnostic"
+        }
+        foreach ($char in [System.IO.Path]::GetInvalidFileNameChars()) {
+            $Name = $Name.Replace($char, "_")
+        }
+        return $Name
+    }
+    # ------------------------------------------------------------
+    # 1. Découverte Redfish
+    # ------------------------------------------------------------
+    try {
+        Write-Verbose "Connexion Redfish : $BaseUri/redfish/v1"
+        $root = Invoke-RedfishJsonGet `
+            -Uri "$BaseUri/redfish/v1"
+    }
+    catch {
+        return [PSCustomObject]@{
+            Success         = $false
+            Status          = "ConnectionFailed"
+            Manufacturer    = $null
+            Controller      = $null
+            Firmware        = $null
+            DiagnosticType  = $null
+            FilePath        = $null
+            SizeBytes       = $null
+            Method          = "Redfish"
+            Error           = $_.Exception.Message
         }
     }
+    # ------------------------------------------------------------
+    # 2. Détermination constructeur
+    #
+    # On regarde les Managers exposés par Redfish.
+    # ------------------------------------------------------------
+    $manufacturer = $null
+    $controller = $null
+    $firmware = $null
+    $managerUri = $null
+    $manager = $null
     try {
-        $BaseUri = "https://$ManagementAddress"
-        Write-DiagLog INFO "Redfish endpoint : $BaseUri"
-        # --------------------------------------------------------
-        # 1. REDFISH ROOT DISCOVERY
-        # --------------------------------------------------------
-        $root = Get-RedfishJson `
-            -Uri "$BaseUri/redfish/v1/" `
-            -Credential $ManagementCredential
-        Write-DiagLog OK "Redfish accessible"
-        # --------------------------------------------------------
-        # 2. IDENTIFICATION CONSTRUCTEUR
-        # --------------------------------------------------------
-        $systemUri = $null
-        $managerUri = $null
-        if ($root.Systems.'@odata.id') {
-            $systemUri = $root.Systems.'@odata.id'
-        }
-        if ($root.Managers.'@odata.id') {
-            $managerUri = $root.Managers.'@odata.id'
-        }
-        if (-not $managerUri) {
+        if (-not $root.Managers.'@odata.id') {
             throw "La ressource Redfish Managers n'est pas exposée."
         }
-        # Récupération du premier Manager
-        $managerCollection = Get-RedfishJson `
-            -Uri "$BaseUri$managerUri" `
-            -Credential $ManagementCredential
-        $managerMember = $managerCollection.Members[0].'@odata.id'
-        if (-not $managerMember) {
-            throw "Impossible de découvrir le Manager Redfish."
+        $managersCollection = Invoke-RedfishJsonGet `
+            -Uri (ConvertTo-AbsoluteRedfishUri $root.Managers.'@odata.id')
+        if (-not $managersCollection.Members) {
+            throw "Aucun Manager Redfish n'a été trouvé."
         }
-        $manager = Get-RedfishJson `
-            -Uri "$BaseUri$managerMember" `
-            -Credential $ManagementCredential
-        $manufacturer = $manager.Manufacturer
-        Write-DiagLog INFO "Manufacturer      : $manufacturer"
-        Write-DiagLog INFO "Manager Model     : $($manager.Model)"
-        Write-DiagLog INFO "Firmware          : $($manager.FirmwareVersion)"
-        # ========================================================
-        # DELL
-        # ========================================================
-        if ($manufacturer -match "Dell") {
-            Write-DiagLog INFO "Dell controller detected"
-            # ----------------------------------------------------
-            # Vérification de la ressource DellLCService
-            # ----------------------------------------------------
-            $dellLcUri =
-                "/redfish/v1/Dell/Managers/iDRAC.Embedded.1/DellLCService"
+        foreach ($member in $managersCollection.Members) {
+            if (-not $member.'@odata.id') {
+                continue
+            }
             try {
-                $dellLc = Get-RedfishJson `
-                    -Uri "$BaseUri$dellLcUri" `
-                    -Credential $ManagementCredential
+                $candidate = Invoke-RedfishJsonGet `
+                    -Uri (ConvertTo-AbsoluteRedfishUri $member.'@odata.id')
             }
             catch {
-                Write-DiagLog WARN `
-                    "DellLCService non accessible via Redfish."
-                throw "Unsupported: ce contrôleur/firmware n'expose pas DellLCService via Redfish."
+                continue
             }
-            Write-DiagLog OK "DellLCService discovered"
-            # ----------------------------------------------------
-            # Endpoint OFFICIEL Dell
-            # ----------------------------------------------------
-            $actionUri =
-                "$BaseUri/redfish/v1/Dell/Managers/" +
-                "iDRAC.Embedded.1/DellLCService/Actions/" +
-                "DellLCService.ExportTechSupportReport"
-            # ----------------------------------------------------
-            # Vérification de l'action
-            # ----------------------------------------------------
-            $actionAvailable = $false
-            try {
-                $action = Get-RedfishJson `
-                    -Uri $actionUri `
-                    -Credential $ManagementCredential
-                $actionAvailable = $true
+            if ($candidate.Manufacturer) {
+                $manufacturer = [string]$candidate.Manufacturer
             }
-            catch {
-                # Certaines implémentations ne permettent pas
-                # GET directement sur l'ActionInfo.
-                # On ne considère PAS cela comme une preuve
-                # que l'action n'existe pas.
-                $actionAvailable = $true
+            if ($candidate.Model) {
+                $controller = [string]$candidate.Model
             }
-            # ----------------------------------------------------
-            # Destination CIFS
-            # ----------------------------------------------------
-            if (-not $ShareCredential) {
-                throw "ShareCredential est obligatoire pour l'export Dell CIFS."
+            if ($candidate.FirmwareVersion) {
+                $firmware = [string]$candidate.FirmwareVersion
             }
-            $shareUser = $ShareCredential.UserName
-            $sharePassword =
-                $ShareCredential.GetNetworkCredential().Password
-            # Exemple :
-            # \\SERVER\Share\Diagnostics
-            #
-            # Dell attend ShareName comme nom/chemin du partage.
-            #
-            # On sépare serveur + partage.
-            if ($DestinationShare -notmatch '^\\\\([^\\]+)\\([^\\]+)(.*)$') {
-                throw "DestinationShare doit être au format \\SERVER\SHARE\OPTIONAL_PATH"
+            if (
+                $candidate.Manufacturer -match "Dell|Hewlett|HPE" -or
+                $candidate.Model -match "iDRAC|iLO"
+            ) {
+                $managerUri = [string]$member.'@odata.id'
+                $manager = $candidate
+                break
             }
-            $shareServer = $Matches[1]
-            $shareName   = $Matches[2]
-            $subPath     = $Matches[3]
-            $fileName =
-                "TSR_{0}_{1}.zip" -f `
-                $ManagementAddress.Replace(".","-"),
-                (Get-Date -Format "yyyyMMdd_HHmmss")
-            if ($subPath) {
-                $relativeSharePath =
-                    ($subPath.Trim("\") + "\" + $fileName)
-            }
-            else {
-                $relativeSharePath = $fileName
-            }
-            # ----------------------------------------------------
-            # Data selectors officiellement documentés
-            # ----------------------------------------------------
-            $selectors = @(
-                "HWData",
-                "OSAppData",
-                "TTYLogs"
-            )
-            $body = @{
-                ShareType          = "CIFS"
-                DataSelectorArrayIn = ($selectors -join ",")
-                IPAddress          = $shareServer
-                ShareName          = $shareName
-                UserName           = $shareUser
-                Password           = $sharePassword
-                FileName           = $relativeSharePath
-            }
-            Write-DiagLog INFO "Starting Dell TSR collection"
-            Write-DiagLog INFO "Destination       : $DestinationShare"
-            Write-DiagLog INFO "File              : $fileName"
-            # ----------------------------------------------------
-            # POST Redfish
-            # ----------------------------------------------------
-            $response = Invoke-RedfishRequest `
-                -Uri $actionUri `
-                -Method POST `
-                -Credential $ManagementCredential `
-                -Body $body
-            Write-DiagLog OK "Dell TSR request accepted"
-            # ----------------------------------------------------
-            # Résultat du job
-            # ----------------------------------------------------
-            $jobId = $null
-            if ($response.Content) {
-                try {
-                    $jobResponse =
-                        $response.Content | ConvertFrom-Json
-                    $jobId = $jobResponse.Job
-                }
-                catch {
-                    # Certaines versions peuvent retourner
-                    # une réponse sans JSON exploitable.
-                }
-            }
-            if ($jobId) {
-                Write-DiagLog INFO "Dell Job : $jobId"
-            }
-            # ----------------------------------------------------
-            # Attente de la génération
-            #
-            # IMPORTANT :
-            # Le POST Dell documenté réalise l'export vers le
-            # partage CIFS. On vérifie donc ensuite que le fichier
-            # apparaît réellement sur le partage.
-            # ----------------------------------------------------
-            $destinationRoot = $DestinationShare.TrimEnd("\")
-            $expectedFile = Join-Path `
-                $destinationRoot `
-                $fileName
-            $timeoutSeconds = 1800
-            $elapsed = 0
-            Write-DiagLog INFO "Waiting for TSR file..."
-            while ($elapsed -lt $timeoutSeconds) {
-                if (Test-Path -LiteralPath $expectedFile) {
-                    $fileInfo =
-                        Get-Item -LiteralPath $expectedFile
-                    if ($fileInfo.Length -gt 0) {
-                        Write-DiagLog OK `
-                            "TSR ZIP successfully created"
-                        return [PSCustomObject]@{
-                            Success          = $true
-                            Manufacturer     = "Dell"
-                            Controller       = $manager.Model
-                            Firmware         = $manager.FirmwareVersion
-                            DiagnosticType   = "TSR"
-                            FileType         = "ZIP"
-                            ManagementIP     = $ManagementAddress
-                            FilePath         = $expectedFile
-                            SizeBytes        = $fileInfo.Length
-                            Job              = $jobId
-                            Method           = "Redfish"
-                        }
-                    }
-                }
-                Start-Sleep -Seconds 10
-                $elapsed += 10
-            }
-            throw `
-                "Timeout: le TSR Dell n'est pas apparu dans le partage après $timeoutSeconds secondes."
-        }
-        # ========================================================
-        # HPE
-        # ========================================================
-        elseif ($manufacturer -match "Hewlett|HPE|HP") {
-            Write-DiagLog INFO "HPE controller detected"
-            # ----------------------------------------------------
-            # Découverte Managers/{id}/ActiveHealthSystem
-            # ----------------------------------------------------
-            $ahsUri = $null
-            # On utilise l'URI réelle du manager découverte
-            # précédemment.
-            $managerId =
-                ($managerMember -split "/")[-1]
-            $candidateUris = @(
-                "$managerMember/ActiveHealthSystem",
-                "/redfish/v1/Managers/$managerId/ActiveHealthSystem"
-            )
-            foreach ($candidate in $candidateUris) {
-                try {
-                    $ahs =
-                        Get-RedfishJson `
-                            -Uri "$BaseUri$candidate" `
-                            -Credential $ManagementCredential
-                    if ($ahs) {
-                        $ahsUri = $candidate
-                        break
-                    }
-                }
-                catch {
-                    continue
-                }
-            }
-            if (-not $ahsUri) {
-                throw `
-                    "Unsupported: ActiveHealthSystem n'est pas exposé par ce contrôleur HPE via Redfish."
-            }
-            Write-DiagLog OK `
-                "HPE ActiveHealthSystem discovered"
-            # ----------------------------------------------------
-            # Récupérer la ressource AHS
-            # ----------------------------------------------------
-            $ahs =
-                Get-RedfishJson `
-                    -Uri "$BaseUri$ahsUri" `
-                    -Credential $ManagementCredential
-            # ----------------------------------------------------
-            # Chercher les liens AHS documentés
-            # ----------------------------------------------------
-            $links = $ahs.Links
-            $downloadUri = $null
-            if ($links) {
-                # Parcours récursif des propriétés Links
-                foreach ($property in $links.PSObject.Properties) {
-                    $value = $property.Value
-                    if ($value -is [string]) {
-                        if ($value -match "ActiveHealth|AHS") {
-                            $downloadUri = $value
-                            break
-                        }
-                    }
-                    if ($value.'@odata.id') {
-                        $downloadUri = $value.'@odata.id'
-                        break
-                    }
-                }
-            }
-            if (-not $downloadUri) {
-                throw `
-                    "ActiveHealthSystem est présent mais aucune URI AHS de téléchargement n'a été découverte."
-            }
-            if ($downloadUri -notmatch '^https?://') {
-                $downloadUri =
-                    "$BaseUri$downloadUri"
-            }
-            # ----------------------------------------------------
-            # Nom du fichier
-            # ----------------------------------------------------
-            $fileName =
-                "AHS_{0}_{1}.ahs" -f `
-                $ManagementAddress.Replace(".","-"),
-                (Get-Date -Format "yyyyMMdd_HHmmss")
-            $destinationFile =
-                Join-Path `
-                    $DestinationShare.TrimEnd("\") `
-                    $fileName
-            # ----------------------------------------------------
-            # URL AHS avec days=N
-            # ----------------------------------------------------
-            if ($downloadUri -notmatch "\?") {
-                $downloadUri += "?days=$AhsDays"
-            }
-            else {
-                $downloadUri += "&days=$AhsDays"
-            }
-            Write-DiagLog INFO `
-                "Downloading HPE AHS ($AhsDays days)"
-            # ----------------------------------------------------
-            # GET BINAIRE REDFISH
-            # ----------------------------------------------------
-            Invoke-RedfishRequest `
-                -Uri $downloadUri `
-                -Method GET `
-                -Credential $ManagementCredential `
-                -Binary `
-                -OutFile $destinationFile | Out-Null
-            # ----------------------------------------------------
-            # Vérification
-            # ----------------------------------------------------
-            if (-not (Test-Path -LiteralPath $destinationFile)) {
-                throw "Le fichier AHS n'a pas été créé."
-            }
-            $fileInfo =
-                Get-Item -LiteralPath $destinationFile
-            if ($fileInfo.Length -le 0) {
-                Remove-Item -LiteralPath $destinationFile -Force
-                throw "Le fichier AHS téléchargé est vide."
-            }
-            Write-DiagLog OK `
-                "HPE AHS successfully downloaded"
-            return [PSCustomObject]@{
-                Success          = $true
-                Manufacturer     = "HPE"
-                Controller       = $manager.Model
-                Firmware         = $manager.FirmwareVersion
-                DiagnosticType   = "AHS"
-                FileType         = "AHS"
-                ManagementIP     = $ManagementAddress
-                FilePath         = $destinationFile
-                SizeBytes        = $fileInfo.Length
-                Method           = "Redfish"
-            }
-        }
-        else {
-            throw `
-                "Unsupported manufacturer via Redfish: $manufacturer"
         }
     }
     catch {
-        Write-DiagLog ERROR $_.Exception.Message
         return [PSCustomObject]@{
-            Success        = $false
-            Manufacturer   = $manufacturer
-            ManagementIP   = $ManagementAddress
-            DiagnosticType = $null
-            FilePath       = $null
-            Method         = "Redfish"
-            Error          = $_.Exception.Message
+            Success         = $false
+            Status          = "ManagerDiscoveryFailed"
+            Manufacturer    = $manufacturer
+            Controller      = $controller
+            Firmware        = $firmware
+            DiagnosticType  = $null
+            FilePath        = $null
+            SizeBytes       = $null
+            Method          = "Redfish"
+            Error           = $_.Exception.Message
         }
     }
-    finally {
-        if ($SkipCertificateCheck -and
-            $PSVersionTable.PSVersion.Major -lt 7) {
-            [System.Net.ServicePointManager]::ServerCertificateValidationCallback =
-                $oldCallback
+    if (-not $managerUri) {
+        return [PSCustomObject]@{
+            Success         = $false
+            Status          = "Unsupported"
+            Manufacturer    = $manufacturer
+            Controller      = $controller
+            Firmware        = $firmware
+            DiagnosticType  = $null
+            FilePath        = $null
+            SizeBytes       = $null
+            Method          = "Redfish"
+            Error           = "Impossible d'identifier un iDRAC ou un iLO via Redfish."
         }
+    }
+    # ============================================================
+    # DELL iDRAC
+    # ============================================================
+    if ($manufacturer -match "Dell" -or $controller -match "iDRAC") {
+        Write-Host ""
+        Write-Host "=== DELL iDRAC ===" -ForegroundColor Cyan
+        Write-Host "Controller : $controller"
+        Write-Host "Firmware   : $firmware"
+        # --------------------------------------------------------
+        # Vérification réelle de l'action SupportAssistCollection
+        #
+        # C'est exactement le mécanisme utilisé par Dell dans son
+        # cmdlet officiel Invoke-SupportAssistCollectionLocalREDFISH.
+        # --------------------------------------------------------
+        $lcServiceUri =
+            "$managerUri/Oem/Dell/DellLCService"
+        try {
+            $lcService = Invoke-RedfishJsonGet `
+                -Uri (ConvertTo-AbsoluteRedfishUri $lcServiceUri)
+        }
+        catch {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "Unsupported"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "DellLCService inaccessible : $($_.Exception.Message)"
+            }
+        }
+        $supportAssistAction = $null
+        if ($lcService.Actions) {
+            $supportAssistAction =
+                $lcService.Actions.PSObject.Properties |
+                Where-Object {
+                    $_.Name -eq "#DellLCService.SupportAssistCollection"
+                } |
+                Select-Object -First 1
+        }
+        if (-not $supportAssistAction) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "Unsupported"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "L'action DellLCService.SupportAssistCollection n'est pas exposée par cet iDRAC."
+            }
+        }
+        # --------------------------------------------------------
+        # Sélection des données
+        #
+        # HWData     = données hardware
+        # DebugLogs  = logs de debug
+        # OSAppData  = données OS/applications
+        # TTYLogs    = TTY logs
+        #
+        # On prend le maximum pertinent pour un diagnostic.
+        # --------------------------------------------------------
+        $dataSelectors = @(
+            "DebugLogs",
+            "HWData",
+            "OSAppData",
+            "TTYLogs"
+        )
+        $bodyObject = [ordered]@{
+            ShareType          = "Local"
+            DataSelectorArrayIn = $dataSelectors
+        }
+        $body = $bodyObject | ConvertTo-Json -Depth 5 -Compress
+        $actionTarget = $null
+        # L'objet Action Redfish contient normalement Target.
+        if ($supportAssistAction.Value.Target) {
+            $actionTarget = [string]$supportAssistAction.Value.Target
+        }
+        # Sécurité : si Target n'est pas fourni, on utilise
+        # l'URI exacte utilisée par Dell dans son cmdlet officiel.
+        if ([string]::IsNullOrWhiteSpace($actionTarget)) {
+            $actionTarget =
+                "$lcServiceUri/Actions/DellLCService.SupportAssistCollection"
+        }
+        $actionTarget = ConvertTo-AbsoluteRedfishUri $actionTarget
+        Write-Host "Action      : DellLCService.SupportAssistCollection"
+        Write-Host "Mode        : Local"
+        Write-Host "Téléchargement : machine PowerShell"
+        # --------------------------------------------------------
+        # Lancement collection
+        # --------------------------------------------------------
+        try {
+            $postResponse = Invoke-RedfishJsonPost `
+                -Uri $actionTarget `
+                -Body $body
+        }
+        catch {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "CollectionStartFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = $_.Exception.Message
+            }
+        }
+        if ($postResponse.StatusCode -ne 200 -and
+            $postResponse.StatusCode -ne 202) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "CollectionStartFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "Lancement SupportAssist refusé : HTTP $($postResponse.StatusCode)"
+            }
+        }
+        # --------------------------------------------------------
+        # Dell retourne une Location contenant le job.
+        #
+        # iDRAC9 :
+        #   /redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/Jobs/...
+        #
+        # iDRAC10 :
+        #   /redfish/v1/TaskService/TaskMonitors/...
+        #
+        # On ne devine pas la génération : on utilise la Location
+        # réellement renvoyée par le contrôleur.
+        # --------------------------------------------------------
+        $jobLocation = Get-ResponseHeader `
+            -Response $postResponse `
+            -Name "Location"
+        if ([string]::IsNullOrWhiteSpace($jobLocation)) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "NoJobLocation"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "Le POST SupportAssist n'a pas retourné de header Location."
+            }
+        }
+        $jobUri = ConvertTo-AbsoluteRedfishUri $jobLocation
+        Write-Host "Job         : $jobUri"
+        Write-Host "Attente de génération du fichier..."
+        # --------------------------------------------------------
+        # Polling
+        # --------------------------------------------------------
+        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+        $downloadUri = $null
+        $lastMessage = $null
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds $PollIntervalSeconds
+            try {
+                $jobResponse = Invoke-WebRequest @(
+                    New-RequestParameters `
+                        -Uri $jobUri `
+                        -Method "GET"
+                )
+            }
+            catch {
+                $lastMessage = $_.Exception.Message
+                Write-Verbose "Polling Dell : $lastMessage"
+                continue
+            }
+            $jobStatusCode = [int]$jobResponse.StatusCode
+            $jobJson = $null
+            if (-not [string]::IsNullOrWhiteSpace($jobResponse.Content)) {
+                try {
+                    $jobJson = $jobResponse.Content | ConvertFrom-Json
+                }
+                catch {
+                    $jobJson = $null
+                }
+            }
+            # ----------------------------------------------------
+            # iDRAC10 :
+            # TaskMonitor termine avec HTTP 204 et Location
+            # vers le fichier TSR.
+            # ----------------------------------------------------
+            if ($jobStatusCode -eq 204) {
+                $downloadLocation = Get-ResponseHeader `
+                    -Response $jobResponse `
+                    -Name "Location"
+                if ($downloadLocation) {
+                    $downloadUri =
+                        ConvertTo-AbsoluteRedfishUri $downloadLocation
+                }
+                break
+            }
+            # ----------------------------------------------------
+            # iDRAC9 :
+            # Le job expose le message de progression et Location
+            # du fichier lorsqu'il est terminé.
+            # ----------------------------------------------------
+            if ($jobJson) {
+                $lastMessage = $null
+                if ($jobJson.Message) {
+                    $lastMessage = [string]$jobJson.Message
+                }
+                $failed =
+                    $false
+                if ($lastMessage) {
+                    if ($lastMessage -match "Fail|Failed|failed|already") {
+                        $failed = $true
+                    }
+                }
+                if ($failed) {
+                    return [PSCustomObject]@{
+                        Success         = $false
+                        Status          = "CollectionFailed"
+                        Manufacturer    = $manufacturer
+                        Controller      = $controller
+                        Firmware        = $firmware
+                        DiagnosticType  = "Dell SupportAssist"
+                        FilePath        = $null
+                        SizeBytes       = $null
+                        Method          = "Redfish OEM"
+                        Error           = "SupportAssist a échoué : $lastMessage"
+                    }
+                }
+                if ($lastMessage -match "complete|completed successfully") {
+                    $downloadLocation = Get-ResponseHeader `
+                        -Response $jobResponse `
+                        -Name "Location"
+                    if ($downloadLocation) {
+                        $downloadUri =
+                            ConvertTo-AbsoluteRedfishUri $downloadLocation
+                    }
+                    else {
+                        # Dell documente également cette URI de
+                        # téléchargement pour le workflow iDRAC9.
+                        $downloadUri =
+                            "$BaseUri/redfish/v1/Dell/sacollect.zip"
+                    }
+                    break
+                }
+            }
+            Write-Host "." -NoNewline
+        }
+        Write-Host ""
+        if ([string]::IsNullOrWhiteSpace($downloadUri)) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "Timeout"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "La collecte n'est pas terminée après $TimeoutMinutes minutes. Dernier message : $lastMessage"
+            }
+        }
+        # --------------------------------------------------------
+        # Téléchargement local du ZIP
+        # --------------------------------------------------------
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $safeController =
+            ConvertTo-SafeFileName $controller
+        $fileName =
+            "Dell_${safeController}_SupportAssist_${timestamp}.zip"
+        $localPath =
+            Join-Path $OutputDirectory $fileName
+        Write-Host "Téléchargement local : $localPath"
+        try {
+            $downloadParams = New-RequestParameters `
+                -Uri $downloadUri `
+                -Method "GET" `
+                -OutFile $localPath
+            # Pour un fichier binaire, on retire Accept JSON.
+            $downloadParams["Headers"] = @{
+                "Accept" = "application/zip, application/octet-stream, */*"
+            }
+            Invoke-WebRequest @downloadParams | Out-Null
+        }
+        catch {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "DownloadFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "Téléchargement du ZIP impossible : $($_.Exception.Message)"
+            }
+        }
+        if (-not (Test-Path -LiteralPath $localPath)) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "DownloadFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "Dell SupportAssist"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "Le fichier ZIP n'a pas été créé localement."
+            }
+        }
+        $fileInfo = Get-Item -LiteralPath $localPath
+        return [PSCustomObject]@{
+            Success         = $true
+            Status          = "Completed"
+            Manufacturer    = $manufacturer
+            Controller      = $controller
+            Firmware        = $firmware
+            DiagnosticType  = "Dell SupportAssist / TSR"
+            FilePath        = $fileInfo.FullName
+            SizeBytes       = $fileInfo.Length
+            Method          = "Redfish OEM - SupportAssistCollection"
+            Error           = $null
+        }
+    }
+    # ============================================================
+    # HPE iLO
+    # ============================================================
+    if ($manufacturer -match "HPE|Hewlett" -or $controller -match "iLO") {
+        Write-Host ""
+        Write-Host "=== HPE iLO ===" -ForegroundColor Cyan
+        Write-Host "Controller : $controller"
+        Write-Host "Firmware   : $firmware"
+        # --------------------------------------------------------
+        # Découverte du lien ActiveHealthSystem.
+        #
+        # HPE documente :
+        # Oem/Hpe/Links/ActiveHealthSystem
+        # --------------------------------------------------------
+        $ahsUri = $null
+        if ($manager.Oem -and
+            $manager.Oem.Hpe -and
+            $manager.Oem.Hpe.Links -and
+            $manager.Oem.Hpe.Links.ActiveHealthSystem) {
+            $ahsLink =
+                $manager.Oem.Hpe.Links.ActiveHealthSystem
+            if ($ahsLink.'@odata.id') {
+                $ahsUri = [string]$ahsLink.'@odata.id'
+            }
+            elseif ($ahsLink.'href') {
+                $ahsUri = [string]$ahsLink.href
+            }
+            elseif ($ahsLink.'extref') {
+                $ahsUri = [string]$ahsLink.extref
+            }
+        }
+        # Certains firmware exposent directement la ressource sous
+        # le Manager. On ne suppose pas l'ID "1" : on utilise le
+        # manager découvert précédemment.
+        if (-not $ahsUri) {
+            $candidateAhsUri =
+                "$managerUri/ActiveHealthSystem"
+            try {
+                $testAhs = Invoke-RedfishJsonGet `
+                    -Uri (ConvertTo-AbsoluteRedfishUri $candidateAhsUri)
+                if ($testAhs.'@odata.type' -match "HpeiLOActiveHealthSystem") {
+                    $ahsUri = $candidateAhsUri
+                }
+            }
+            catch {
+                # On laisse le message Unsupported plus bas.
+            }
+        }
+        if (-not $ahsUri) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "Unsupported"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "HPE Active Health System"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "La ressource HpeiLOActiveHealthSystem n'est pas exposée par cet iLO."
+            }
+        }
+        $ahsUri = ConvertTo-AbsoluteRedfishUri $ahsUri
+        Write-Host "AHS resource : $ahsUri"
+        # --------------------------------------------------------
+        # GET ActiveHealthSystem
+        # --------------------------------------------------------
+        try {
+            $ahsResource = Invoke-RedfishJsonGet -Uri $ahsUri
+        }
+        catch {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "AhsDiscoveryFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "HPE Active Health System"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = $_.Exception.Message
+            }
+        }
+        # --------------------------------------------------------
+        # HPE documente Links.AHSLocation.extref
+        # --------------------------------------------------------
+        $ahsDownloadUri = $null
+        if ($ahsResource.Links -and
+            $ahsResource.Links.AHSLocation) {
+            if ($ahsResource.Links.AHSLocation.extref) {
+                $ahsDownloadUri =
+                    [string]$ahsResource.Links.AHSLocation.extref
+            }
+        }
+        if (-not $ahsDownloadUri) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "AhsLocationUnavailable"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "HPE Active Health System"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM"
+                Error           = "Links.AHSLocation.extref n'est pas disponible dans la ressource AHS."
+            }
+        }
+        # --------------------------------------------------------
+        # Si days est spécifié :
+        #
+        # /ahsdata/...ahs?days=7
+        #
+        # Sinon :
+        #
+        # /ahsdata/...ahs?downloadAll=1
+        # --------------------------------------------------------
+        if ($AhsDays) {
+            # On retire éventuellement les paramètres déjà présents.
+            $ahsDownloadUri = $ahsDownloadUri -replace '\?.*$', ''
+            $ahsDownloadUri =
+                "$ahsDownloadUri?days=$AhsDays"
+        }
+        else {
+            # L'URL officielle peut déjà contenir downloadAll=1.
+            # Si elle ne l'a pas, on l'ajoute.
+            if ($ahsDownloadUri -notmatch 'downloadAll=') {
+                if ($ahsDownloadUri.Contains("?")) {
+                    $ahsDownloadUri += "&downloadAll=1"
+                }
+                else {
+                    $ahsDownloadUri += "?downloadAll=1"
+                }
+            }
+        }
+        $ahsDownloadUri =
+            ConvertTo-AbsoluteRedfishUri $ahsDownloadUri
+        Write-Host "AHS download : $ahsDownloadUri"
+        # --------------------------------------------------------
+        # Nom local
+        # --------------------------------------------------------
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $safeController =
+            ConvertTo-SafeFileName $controller
+        $fileName =
+            "HPE_${safeController}_AHS_${timestamp}.ahs"
+        $localPath =
+            Join-Path $OutputDirectory $fileName
+        Write-Host "Téléchargement local : $localPath"
+        # --------------------------------------------------------
+        # GET binaire AHS
+        # --------------------------------------------------------
+        try {
+            $downloadParams = New-RequestParameters `
+                -Uri $ahsDownloadUri `
+                -Method "GET" `
+                -OutFile $localPath
+            $downloadParams["Headers"] = @{
+                "Accept" = "application/octet-stream, application/octet-stream"
+            }
+            Invoke-WebRequest @downloadParams | Out-Null
+        }
+        catch {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "DownloadFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "HPE Active Health System"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM - ActiveHealthSystem"
+                Error           = "Téléchargement AHS impossible : $($_.Exception.Message)"
+            }
+        }
+        if (-not (Test-Path -LiteralPath $localPath)) {
+            return [PSCustomObject]@{
+                Success         = $false
+                Status          = "DownloadFailed"
+                Manufacturer    = $manufacturer
+                Controller      = $controller
+                Firmware        = $firmware
+                DiagnosticType  = "HPE Active Health System"
+                FilePath        = $null
+                SizeBytes       = $null
+                Method          = "Redfish OEM - ActiveHealthSystem"
+                Error           = "Le fichier AHS n'a pas été créé localement."
+            }
+        }
+        $fileInfo = Get-Item -LiteralPath $localPath
+        return [PSCustomObject]@{
+            Success         = $true
+            Status          = "Completed"
+            Manufacturer    = $manufacturer
+            Controller      = $controller
+            Firmware        = $firmware
+            DiagnosticType  = "HPE Active Health System"
+            FilePath        = $fileInfo.FullName
+            SizeBytes       = $fileInfo.Length
+            Method          = "Redfish OEM - HpeiLOActiveHealthSystem"
+            Error           = $null
+        }
+    }
+    # ============================================================
+    # Constructeur non supporté
+    # ============================================================
+    return [PSCustomObject]@{
+        Success         = $false
+        Status          = "Unsupported"
+        Manufacturer    = $manufacturer
+        Controller      = $controller
+        Firmware        = $firmware
+        DiagnosticType  = $null
+        FilePath        = $null
+        SizeBytes       = $null
+        Method          = "Redfish"
+        Error           = "Constructeur de BMC non supporté par cette fonction."
     }
 }
 
-Exemple Dell
+Utilisation Dell
 
-$idracCredential = Get-Credential
-$shareCredential = Get-Credential
+Par exemple :
+
+$cred = Get-Credential
 $result = Get-HardwareDiagnostic `
     -ManagementAddress "10.10.10.50" `
-    -ManagementCredential $idracCredential `
-    -ShareCredential $shareCredential `
-    -DestinationShare "\\BMAAS-SRV\Diagnostics" `
+    -Credential $cred `
+    -OutputDirectory "C:\BMAAS\Diagnostics" `
     -SkipCertificateCheck
-$result
+$result | Format-List
 
-Pour Dell, le résultat attendu est :
+Tu obtiendras quelque chose du genre :
 
 Success        : True
-Manufacturer   : Dell
-DiagnosticType : TSR
-FileType       : ZIP
-FilePath       : \\BMAAS-SRV\Diagnostics\TSR_10-10-10-50_20261008_100000.zip
-Method         : Redfish
+Status         : Completed
+Manufacturer   : Dell Inc.
+Controller     : iDRAC9
+Firmware       : 7.x.x.x
+DiagnosticType : Dell SupportAssist / TSR
+FilePath       : C:\BMAAS\Diagnostics\Dell_iDRAC9_SupportAssist_20261008_193000.zip
+SizeBytes      : 18456321
+Method         : Redfish OEM - SupportAssistCollection
+Error          :
 
-Important : le ShareCredential doit avoir le droit d’écrire dans le partage. L’iDRAC utilise ces identifiants pour déposer le ZIP. Dell documente CIFS comme ShareType et ShareName, UserName, Password, IPAddress et FileName comme paramètres de l’action. 
+Point important : le ZIP est téléchargé par Invoke-WebRequest vers C:\BMAAS\Diagnostics. Il n’est jamais demandé à l’iDRAC de déposer le fichier sur un partage réseau.
 
-Exemple HPE
+Dell confirme dans son propre module que le lancement se fait avec :
 
-$iloCredential = Get-Credential
+ShareType = Local
+DataSelectorArrayIn = DebugLogs / HWData / OSAppData / TTYLogs
+
+puis sur iDRAC9 le job est interrogé sous .../Oem/Dell/Jobs/..., tandis que pour iDRAC10 le module Dell utilise .../TaskService/TaskMonitors/.... 
+
+Utilisation HPE
+
+Pour télécharger tout l’AHS :
+
+$cred = Get-Credential
 $result = Get-HardwareDiagnostic `
     -ManagementAddress "10.10.10.60" `
-    -ManagementCredential $iloCredential `
-    -DestinationShare "\\BMAAS-SRV\Diagnostics" `
-    -AhsDays 30 `
+    -Credential $cred `
+    -OutputDirectory "C:\BMAAS\Diagnostics" `
     -SkipCertificateCheck
-$result
+$result | Format-List
 
-Ici, contrairement à Dell, PowerShell télécharge le fichier AHS par Redfish, puis l’écrit directement dans le partage. C’est conforme au workflow HPE documenté : découverte de HpeiLOActiveHealthSystem, récupération de l’URI AHS et GET binaire avec days, from/to ou downloadAll. 
+Pour seulement les 7 derniers jours :
 
-⚠️ Une limite volontaire sur iDRAC 7/8
+$result = Get-HardwareDiagnostic `
+    -ManagementAddress "10.10.10.60" `
+    -Credential $cred `
+    -OutputDirectory "C:\BMAAS\Diagnostics" `
+    -AhsDays 7 `
+    -SkipCertificateCheck
 
-Je veux être très clair là-dessus parce que c’est précisément ce que tu m’as demandé : je n’ai pas ajouté un faux endpoint pour iDRAC7/8.
+HPE documente bien days=N pour limiter la période et downloadAll=1 pour télécharger l’intégralité de l’AHS. Le fichier retourné est un téléchargement binaire HTTP 200 que le client peut sauvegarder localement. 
 
-Dell documente officiellement ExportTechSupportReport sur les guides Redfish iDRAC9. Pour iDRAC7/8, la documentation Dell actuelle renvoie à leur procédure d’export TSR/SupportAssist via leurs interfaces/CLI, et je n’ai pas trouvé de documentation constructeur établissant un endpoint Redfish équivalent permettant de générer le ZIP. 
+Et surtout : ce que je ne prétends PAS
 
-Donc avec ton exigence « 100 % Redfish », le comportement correct est :
+Je ne vais pas te dire :
 
-iDRAC9/10 compatible
-        ↓
-Redfish
-        ↓
-TSR.zip
-        ↓
-Share
+« iDRAC 7 = forcément supporté, iDRAC 8 = forcément supporté, iDRAC 9 = forcément supporté… »
 
-mais :
+juste parce que le numéro de version existe.
 
-iDRAC7/8
-        ↓
-Redfish
-        ↓
-capacité TSR non documentée/exposée
-        ↓
-UNSUPPORTED
+La fonction teste réellement la capacité Redfish exposée par le BMC. Pour Dell, elle vérifie que #DellLCService.SupportAssistCollection existe avant de lancer quoi que ce soit. C’est également la logique employée par le script Dell officiel. 
 
-Pas de RACADM en douce.
+Donc si tu lui donnes un ancien iDRAC qui ne publie pas cette action, tu obtiens :
 
-C’est important aussi parce que Dell a encore modifié les mécanismes SupportAssist/TSR entre générations et firmwares. 
+Status : Unsupported
 
-Enfin, pour ton usage BMAAS, je te conseille de garder cette séparation : Dell → iDRAC écrit le ZIP directement dans le share ; HPE → PowerShell télécharge l’AHS puis le copie dans le share. C’est beaucoup plus fidèle aux API Redfish réellement documentées que d’essayer de forcer Dell et HPE dans exactement le même workflow.
+et pas un faux succès, pas de RACADM caché, pas de fallback.
+
+Pour HPE, même logique : on cherche réellement HpeiLOActiveHealthSystem, puis Links.AHSLocation.extref. HPE indique que l’URI AHS n’est justement pas à inventer : elle doit être lue depuis cette propriété. 
+
+C’est cette approche que je te conseille pour BMAAS : capability-based plutôt que version-based. Elle sera beaucoup plus propre quand tu vas rencontrer différents modèles Dell/HPE et différentes versions de firmware.
+
+lien 
+https://hewlettpackard.github.io/ilo-rest-api-docs/ilo4/?utm_source=chatgpt.com#redfish-1-0-conformance
